@@ -15,7 +15,7 @@ from easydict import EasyDict as edict
 from trellis.pipelines import TrellisImageTo3DPipeline
 from trellis.representations import Gaussian, MeshExtractResult
 from trellis.utils import render_utils, postprocessing_utils
-from fastapi import FastAPI, UploadFile, Form
+from fastapi import FastAPI, UploadFile, Form, BackgroundTasks
 from pydantic import BaseModel
 import uvicorn
 
@@ -151,18 +151,6 @@ def generate(input):
         del values['notify_uri']
         notify_token = values['notify_token']
         del values['notify_token']
-        discord_id = values['discord_id']
-        del values['discord_id']
-        if(discord_id == "discord_id"):
-            discord_id = os.getenv('com_camenduru_discord_id')
-        discord_channel = values['discord_channel']
-        del values['discord_channel']
-        if(discord_channel == "discord_channel"):
-            discord_channel = os.getenv('com_camenduru_discord_channel')
-        discord_token = values['discord_token']
-        del values['discord_token']
-        if(discord_token == "discord_token"):
-            discord_token = os.getenv('com_camenduru_discord_token')
         job_id = values['job_id']
         del values['job_id']
         default_filename = os.path.basename(result[0])
@@ -172,16 +160,7 @@ def generate(input):
             filename = os.path.basename(path)
             with open(path, "rb") as file:
                 files[filename] = file.read()
-        payload = {"content": f"{json.dumps(values)} <@{discord_id}>"}
-        response = requests.post(
-            f"https://discord.com/api/v9/channels/{discord_channel}/messages",
-            data=payload,
-            headers={"Authorization": f"Bot {discord_token}"},
-            files=files
-        )
-        response.raise_for_status()
-        result_urls = [attachment['url'] for attachment in response.json()['attachments']]
-        notify_payload = {"jobId": job_id, "result": str(result_urls), "status": "DONE"}
+        notify_payload = {"jobId": job_id, "result": str(result), "status": "DONE"}
         web_notify_uri = os.getenv('com_camenduru_web_notify_uri')
         web_notify_token = os.getenv('com_camenduru_web_notify_token')
         if(notify_uri == "notify_uri"):
@@ -189,7 +168,7 @@ def generate(input):
         else:
             requests.post(web_notify_uri, data=json.dumps(notify_payload), headers={'Content-Type': 'application/json', "Authorization": web_notify_token})
             requests.post(notify_uri, data=json.dumps(notify_payload), headers={'Content-Type': 'application/json', "Authorization": notify_token})
-        return {"jobId": job_id, "result": str(result_urls), "status": "DONE"}
+        return {"jobId": job_id, "result": str(result), "status": "DONE"}
     except Exception as e:
         error_payload = {"jobId": job_id, "status": "FAILED"}
         try:
@@ -206,16 +185,19 @@ def generate(input):
             os.remove(video_path)
         if os.path.exists(glb_path):
             os.remove(glb_path)
-        if os.path.exists("/content/trellis-tost.png"):
-            os.remove("/content/trellis-tost.png")
+        if os.path.exists(input_image):
+            os.remove(input_image)
+
+@app.get("/")
+def default_route():
+    return {"runpod worker is running..."}
 
 @app.get("/health")
 def health_check():
     return {"status": "OK"}
 
 @app.post("/generate")
-def generate_route(input: dict):
-    return generate(input)
+def generate_route(input: dict, background_tasks: BackgroundTasks):
+    background_tasks.add_task(generate, input)
         
 uvicorn.run(app, host="0.0.0.0", port=8000)
-        
