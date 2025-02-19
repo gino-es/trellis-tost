@@ -1,37 +1,171 @@
-import os
-import json
-import uuid
-import requests
-import random
-import time
+import os, json, requests, random, time, runpod
 from urllib.parse import urlsplit
+
 import numpy as np
 import torch
 import imageio
-
 from typing import *
 from PIL import Image
 from easydict import EasyDict as edict
 from trellis.pipelines import TrellisImageTo3DPipeline
 from trellis.representations import Gaussian, MeshExtractResult
 from trellis.utils import render_utils, postprocessing_utils
-from fastapi import FastAPI, UploadFile, Form, BackgroundTasks
-from pydantic import BaseModel
-import uvicorn
 
-app = FastAPI()
+import uvicorn, uuid, asyncio
+from fastapi import FastAPI, UploadFile, Form, BackgroundTasks, File, HTTPException
+from fastapi.responses import JSONResponse
+from enum import Enum
+from collections import deque
+from typing import Dict, Deque, Optional
+from datetime import datetime
 
 MAX_SEED = np.iinfo(np.int32).max
-TMP_DIR = "/content"
 
-def preprocess_image(image_path: str) -> Tuple[str, Image.Image]:
-    trial_id = f"{int(time.time() * 1000)}-{uuid.uuid4()}"
-    image = Image.open(image_path).convert("RGBA")
-    processed_image = pipeline.preprocess_image(image)
-    processed_image.save(f"{TMP_DIR}/{trial_id}.png")
-    return trial_id, processed_image
+# Directories
+TMP_DIR = "content"
+IMG_DIR = "images"
+MODEL_DIR = "models"
 
-def pack_state(gs: Gaussian, mesh: MeshExtractResult, trial_id: str) -> dict:
+class TaskStatus(Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+
+#------------------------------------------------------------------------------------------------
+# Task Manager Class
+#------------------------------------------------------------------------------------------------
+
+class TaskManager:
+    def __init__(self):
+        self.task_queue: Deque[str] = deque()
+        self.task_status: Dict[str, dict] = {}
+        self.is_processing = False
+        self.processing_task: Optional[str] = None
+        self.last_task_completed = datetime.now()
+        # Start processing loop
+        self._process_task = asyncio.create_task(self.process_queue())  
+
+    async def process_queue(self) -> None:
+        while True:  # Continuous processing loop
+            try:
+                if not self.is_processing and self.task_queue:
+                    self.is_processing = True
+                    task_id = self.task_queue.popleft()
+                    self.processing_task = task_id
+                    
+                    idle_time = (datetime.now() - self.last_task_completed).total_seconds()
+                    print(f"Starting task {task_id}. Idle time: {idle_time:.2f}s")
+                    
+                    task = self.task_status[task_id]
+                    input_image = None
+                    glb = None
+                    
+                    try:
+                        self.update_task_status(task_id, TaskStatus.RUNNING)
+                        
+                        input_image = os.path.join(TMP_DIR, IMG_DIR, 
+                            f"{task['image_token']}.{task['extension']}")
+                        
+                        state = image_to_3d(input_image)
+                        glb = extract_glb(state)
+                        
+                        # Upload to S3 using the presigned URL
+                        print(f"Uploading model to: {task['upload_url']}")
+                        with open(glb, 'rb') as f:
+                            response = requests.put(task['upload_url'], data=f)
+                            response.raise_for_status()  # Raise exception for failed upload
+                        
+                        self.update_task_status(task_id, TaskStatus.SUCCESS)
+                        print(f"Model uploaded successfully for task {task_id}")
+                        
+                    except Exception as e:
+                        print(f"Error processing task {task_id}: {str(e)}")
+                        self.update_task_status(task_id, TaskStatus.FAILED, error=str(e))
+                    finally:
+                        # Cleanup temporary files
+                        for path in [input_image, glb]:
+                            if path and os.path.exists(path):
+                                os.remove(path)
+                        
+                        self.last_task_completed = datetime.now()
+                        self.is_processing = False
+                        self.processing_task = None
+                        
+                        queue_size = len(self.task_queue)
+                        print(f"Completed task {task_id}. Remaining queue size: {queue_size}")
+                
+                if self.is_processing:
+                    print(f"Processing task {self.processing_task}..., {len(self.task_queue)} tasks remaining")
+                else:
+                    idle_time = (datetime.now() - self.last_task_completed).total_seconds()
+                    print(f"No tasks to process. Idle time: {idle_time:.2f}s")
+                
+                await asyncio.sleep(10)  # Check queue every 10 seconds
+                
+            except Exception as e:
+                print(f"Error in process_queue: {e}")
+                self.is_processing = False
+                self.processing_task = None
+                await asyncio.sleep(10)  # Wait on error before retrying
+
+    def new_task(self, image_token: str, image_extension: str) -> None:
+        print(f"Adding task {image_token} to queue. Current queue size: {len(self.task_queue)}")
+        self.task_status[image_token] = {
+            "status": TaskStatus.QUEUED.value,
+            "image_token": image_token,
+            "image_extension": image_extension,
+            "upload_url": None,
+            "error": None,
+            "queued_at": None,
+            "started_at": None,
+            "completed_at": None,
+            "processing_time": None,
+            "queue_time": None
+        }
+
+    def update_task_status(self, task_id: str, status: TaskStatus, error: str = None) -> None:
+        if task_id in self.task_status:
+            now = datetime.now()
+            update = {
+                "status": status.value,
+                "updated_at": now.isoformat()
+            }
+            
+            if status == TaskStatus.RUNNING:
+                update["started_at"] = now.isoformat()
+            elif status in [TaskStatus.SUCCESS, TaskStatus.FAILED]:
+                update["completed_at"] = now.isoformat()
+                started_at = datetime.fromisoformat(self.task_status[task_id]["started_at"]) if self.task_status[task_id]["started_at"] else now
+                queued_at = datetime.fromisoformat(self.task_status[task_id]["queued_at"])
+                update["processing_time"] = (now - started_at).total_seconds()
+                update["queue_time"] = (started_at - queued_at).total_seconds()
+            
+            if error:
+                update["error"] = error
+                
+            self.task_status[task_id].update(update)
+        else:
+            print("Task not found: ", task_id)
+
+    def queue_task(self, image_token: str, upload_url: str) -> None:
+
+        if image_token not in self.task_queue:
+            self.task_queue.append(image_token)
+            self.task_status[image_token].update({"queued_at": datetime.now().isoformat(), "upload_url": upload_url})
+            print(f"Task {image_token} added to queue. Current queue size: {len(self.task_queue)}")
+        else:
+            print(f"Task {image_token} is already in the queue.")
+
+    def get_task_status(self, task_id: str) -> dict:
+        return self.task_status.get(task_id)
+
+# Initialize task manager
+task_manager = TaskManager()
+pipeline = TrellisImageTo3DPipeline.from_pretrained("/content/model")
+pipeline.cuda()
+
+def pack_state(gs: Gaussian, mesh: MeshExtractResult) -> dict:
     return {
         'gaussian': {
             **gs.init_params,
@@ -44,11 +178,10 @@ def pack_state(gs: Gaussian, mesh: MeshExtractResult, trial_id: str) -> dict:
         'mesh': {
             'vertices': mesh.vertices.cpu().numpy(),
             'faces': mesh.faces.cpu().numpy(),
-        },
-        'trial_id': trial_id,
+        }
     }
 
-def unpack_state(state: dict) -> Tuple[Gaussian, edict, str]:
+def unpack_state(state: dict) -> Tuple[Gaussian, edict]:
     gs = Gaussian(
         aabb=state['gaussian']['aabb'],
         sh_degree=state['gaussian']['sh_degree'],
@@ -68,45 +201,32 @@ def unpack_state(state: dict) -> Tuple[Gaussian, edict, str]:
         faces=torch.tensor(state['mesh']['faces'], device='cuda'),
     )
 
-    return gs, mesh, state['trial_id']
+    return gs, mesh
 
-def image_to_3d(image_path: str, seed: int = 0, randomize_seed: bool = True,
-                ss_guidance_strength: float = 7.5, ss_sampling_steps: int = 12,
-                slat_guidance_strength: float = 3.0, slat_sampling_steps: int = 12) -> Tuple[dict, str]:
-    trial_id, _ = preprocess_image(image_path)
-    if randomize_seed:
-        seed = np.random.randint(0, MAX_SEED)
+def image_to_3d(image_path: str) -> dict:
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found: {image_path}")
 
+    image = Image.open(image_path).convert("RGBA")
     outputs = pipeline.run(
-        Image.open(f"{TMP_DIR}/{trial_id}.png"),
-        seed=seed,
+        image,
+        seed=np.random.randint(0, MAX_SEED),
         formats=["gaussian", "mesh"],
-        preprocess_image=False,
-        sparse_structure_sampler_params={
-            "steps": ss_sampling_steps,
-            "cfg_strength": ss_guidance_strength,
-        },
-        slat_sampler_params={
-            "steps": slat_sampling_steps,
-            "cfg_strength": slat_guidance_strength,
-        },
+        preprocess_image=True
     )
 
-    video = render_utils.render_video(outputs['gaussian'][0], num_frames=120)['color']
-    video_geo = render_utils.render_video(outputs['mesh'][0], num_frames=120)['normal']
-    video = [np.concatenate([video[i], video_geo[i]], axis=1) for i in range(len(video))]
-    video_path = f"{TMP_DIR}/{trial_id}.mp4"
-    imageio.mimsave(video_path, video, fps=15)
+    return pack_state(outputs['gaussian'][0], outputs['mesh'][0])
 
-    state = pack_state(outputs['gaussian'][0], outputs['mesh'][0], str(trial_id))
-    return state, video_path
-
-def extract_glb(state: dict, mesh_simplify: float = 0.95, texture_size: int = 1024) -> str:
-    gs, mesh, trial_id = unpack_state(state)
-    glb = postprocessing_utils.to_glb(gs, mesh, simplify=mesh_simplify, texture_size=texture_size, verbose=False)
-    glb_path = f"{TMP_DIR}/{trial_id}.glb"
-    glb.export(glb_path)
-    return glb_path
+def extract_glb(state: dict) -> str:
+    gs, mesh = unpack_state(state)
+    glb = postprocessing_utils.to_glb(
+        gs, 
+        mesh, 
+        simplify=0.95, 
+        texture_size=1024, 
+        verbose=False
+    )
+    return glb
 
 def download_file(url, save_dir, file_name):
     os.makedirs(save_dir, exist_ok=True)
@@ -119,74 +239,7 @@ def download_file(url, save_dir, file_name):
         file.write(response.content)
     return file_path
 
-pipeline = TrellisImageTo3DPipeline.from_pretrained("/content/model")
-pipeline.cuda()
-
-def generate(input):
-    values = input["input"]
-
-    input_image = values['input_image']
-    input_image = download_file(url=input_image, save_dir=TMP_DIR, file_name='input_image')
-    seed = values['seed']
-    randomize_seed = values['randomize_seed']
-    ss_guidance_strength = values['ss_guidance_strength']
-    ss_sampling_steps = values['ss_sampling_steps']
-    slat_guidance_strength = values['slat_guidance_strength']
-    slat_sampling_steps = values['slat_sampling_steps']
-    mesh_simplify = values['mesh_simplify']
-    texture_size = values['texture_size']
-
-    state, video_path = image_to_3d(image_path=input_image, 
-                                    seed=seed, 
-                                    randomize_seed=randomize_seed, 
-                                    ss_guidance_strength=ss_guidance_strength, 
-                                    ss_sampling_steps=ss_sampling_steps,
-                                    slat_guidance_strength=slat_guidance_strength,
-                                    slat_sampling_steps=slat_sampling_steps)
-    glb_path = extract_glb(state=state, mesh_simplify=mesh_simplify, texture_size=texture_size)
-
-    result = [video_path, [glb_path, input_image]]
-    try:
-        notify_uri = values['notify_uri']
-        del values['notify_uri']
-        notify_token = values['notify_token']
-        del values['notify_token']
-        job_id = values['job_id']
-        del values['job_id']
-        default_filename = os.path.basename(result[0])
-        with open(result[0], "rb") as file:
-            files = {default_filename: file.read()}
-        for path in result[1]:
-            filename = os.path.basename(path)
-            with open(path, "rb") as file:
-                files[filename] = file.read()
-        notify_payload = {"jobId": job_id, "result": str(result), "status": "DONE"}
-        web_notify_uri = os.getenv('com_camenduru_web_notify_uri')
-        web_notify_token = os.getenv('com_camenduru_web_notify_token')
-        if(notify_uri == "notify_uri"):
-            requests.post(web_notify_uri, data=json.dumps(notify_payload), headers={'Content-Type': 'application/json', "Authorization": web_notify_token})
-        else:
-            requests.post(web_notify_uri, data=json.dumps(notify_payload), headers={'Content-Type': 'application/json', "Authorization": web_notify_token})
-            requests.post(notify_uri, data=json.dumps(notify_payload), headers={'Content-Type': 'application/json', "Authorization": notify_token})
-        return {"jobId": job_id, "result": str(result), "status": "DONE"}
-    except Exception as e:
-        error_payload = {"jobId": job_id, "status": "FAILED"}
-        try:
-            if(notify_uri == "notify_uri"):
-                requests.post(web_notify_uri, data=json.dumps(error_payload), headers={'Content-Type': 'application/json', "Authorization": web_notify_token})
-            else:
-                requests.post(web_notify_uri, data=json.dumps(error_payload), headers={'Content-Type': 'application/json', "Authorization": web_notify_token})
-                requests.post(notify_uri, data=json.dumps(error_payload), headers={'Content-Type': 'application/json', "Authorization": notify_token})
-        except:
-            pass
-        return {"jobId": job_id, "result": f"FAILED: {str(e)}", "status": "FAILED"}
-    finally:
-        if os.path.exists(video_path):
-            os.remove(video_path)
-        if os.path.exists(glb_path):
-            os.remove(glb_path)
-        if os.path.exists(input_image):
-            os.remove(input_image)
+app = FastAPI()
 
 @app.get("/")
 def default_route():
@@ -196,8 +249,70 @@ def default_route():
 def health_check():
     return {"status": "OK"}
 
-@app.post("/generate")
-def generate_route(input: dict, background_tasks: BackgroundTasks):
-    background_tasks.add_task(generate, input)
+@app.get("/task/{task_id}")
+async def get_task_status(task_id: str) -> dict:
+    status = task_manager.get_task_status(task_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return status
+
+@app.get("/tasks")
+async def get_all_tasks() -> dict:
+    return {
+        "queue_length": len(task_manager.task_queue),
+        "tasks": task_manager.task_status
+    }
+
+@app.post("/upload_image")
+async def upload_image(file: UploadFile = File(...)):
+    try:
+        file_ext = os.path.splitext(file.filename)[1].lower().lstrip('.')
+        if file_ext not in ['jpg', 'jpeg', 'png']:
+            return JSONResponse(
+                content={"error": f"Unsupported image format. Only JPG and PNG are supported: {file_ext}"},
+                status_code=400
+            )
+
+        image_token = str(uuid.uuid4())
+        task_manager.new_task(image_token, file_ext)
         
-uvicorn.run(app, host="0.0.0.0", port=8000)
+        save_dir = os.path.join(TMP_DIR, IMG_DIR)
+        os.makedirs(save_dir, exist_ok=True)
+        
+        file_content = await file.read()
+        file_path = os.path.join(save_dir, f"{image_token}.{file_ext}")
+        
+        with open(file_path, "wb") as f:
+            f.write(file_content)
+
+        return JSONResponse(content={
+            "data": {
+                "image_token": image_token
+            }
+        })
+        
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+@app.post("/generate_model")
+async def generate_model(request: dict):
+    try:
+        input_data = request["input"]
+        image_token = input_data["image_token"]
+        upload_url = input_data["upload_url"]
+
+        task_manager.queue_task(image_token, upload_url)
+        queue_length = len(task_manager.task_queue)
+        
+        return JSONResponse(content={
+            "data": {
+                "task_id": image_token,
+                "queue_position": queue_length
+            }
+        })
+        
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
