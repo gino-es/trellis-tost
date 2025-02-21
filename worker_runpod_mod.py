@@ -14,10 +14,12 @@ from trellis.utils import render_utils, postprocessing_utils
 import uvicorn, uuid, asyncio
 from fastapi import FastAPI, UploadFile, Form, BackgroundTasks, File, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from enum import Enum
 from collections import deque
 from typing import Dict, Deque, Optional
 from datetime import datetime
+import logging
 
 MAX_SEED = np.iinfo(np.int32).max
 
@@ -38,79 +40,37 @@ class TaskStatus(Enum):
 
 class TaskManager:
     def __init__(self):
-        self.task_queue: Deque[str] = deque()
+        self.task_queue: asyncio.Queue = asyncio.Queue()
         self.task_status: Dict[str, dict] = {}
         self.is_processing = False
         self.processing_task: Optional[str] = None
         self.last_task_completed = datetime.now()
-        # Start processing loop
-        self._process_task = asyncio.create_task(self.process_queue())  
 
     async def process_queue(self) -> None:
-        while True:  # Continuous processing loop
+        while True:
             try:
-                if not self.is_processing and self.task_queue:
-                    self.is_processing = True
-                    task_id = self.task_queue.popleft()
-                    self.processing_task = task_id
-                    
-                    idle_time = (datetime.now() - self.last_task_completed).total_seconds()
-                    print(f"Starting task {task_id}. Idle time: {idle_time:.2f}s")
-                    
-                    task = self.task_status[task_id]
-                    input_image = None
-                    glb = None
-                    
-                    try:
-                        self.update_task_status(task_id, TaskStatus.RUNNING)
-                        
-                        input_image = os.path.join(TMP_DIR, IMG_DIR, 
-                            f"{task['image_token']}.{task['extension']}")
-                        
-                        state = image_to_3d(input_image)
-                        glb = extract_glb(state)
-                        
-                        # Upload to S3 using the presigned URL
-                        print(f"Uploading model to: {task['upload_url']}")
-                        with open(glb, 'rb') as f:
-                            response = requests.put(task['upload_url'], data=f)
-                            response.raise_for_status()  # Raise exception for failed upload
-                        
-                        self.update_task_status(task_id, TaskStatus.SUCCESS)
-                        print(f"Model uploaded successfully for task {task_id}")
-                        
-                    except Exception as e:
-                        print(f"Error processing task {task_id}: {str(e)}")
-                        self.update_task_status(task_id, TaskStatus.FAILED, error=str(e))
-                    finally:
-                        # Cleanup temporary files
-                        for path in [input_image, glb]:
-                            if path and os.path.exists(path):
-                                os.remove(path)
-                        
-                        self.last_task_completed = datetime.now()
-                        self.is_processing = False
-                        self.processing_task = None
-                        
-                        queue_size = len(self.task_queue)
-                        print(f"Completed task {task_id}. Remaining queue size: {queue_size}")
+                # Wait for a task to be available - this is non-blocking and more efficient
+                task_id = await self.task_queue.get()
                 
-                if self.is_processing:
-                    print(f"Processing task {self.processing_task}..., {len(self.task_queue)} tasks remaining")
-                else:
-                    idle_time = (datetime.now() - self.last_task_completed).total_seconds()
-                    print(f"No tasks to process. Idle time: {idle_time:.2f}s")
+                self.is_processing = True
+                self.processing_task = task_id
                 
-                await asyncio.sleep(10)  # Check queue every 10 seconds
+                idle_time = (datetime.now() - self.last_task_completed).total_seconds()
+                print(f"Starting task {task_id}. Idle time: {idle_time:.2f}s")
+                
+                await self._process_single_task(task_id)
+                
+                # Mark task as done
+                self.task_queue.task_done()
                 
             except Exception as e:
-                print(f"Error in process_queue: {e}")
+                print(f"Critical error in process_queue: {e}")
+            finally:
                 self.is_processing = False
                 self.processing_task = None
-                await asyncio.sleep(10)  # Wait on error before retrying
 
     def new_task(self, image_token: str, image_extension: str) -> None:
-        print(f"Adding task {image_token} to queue. Current queue size: {len(self.task_queue)}")
+        print(f"Adding task {image_token}")
         self.task_status[image_token] = {
             "status": TaskStatus.QUEUED.value,
             "image_token": image_token,
@@ -149,21 +109,73 @@ class TaskManager:
             print("Task not found: ", task_id)
 
     def queue_task(self, image_token: str, upload_url: str) -> None:
+        if image_token not in self.task_status:
+            print(f"Error: Task {image_token} not found in task_status. Cannot queue.")
+            return
 
-        if image_token not in self.task_queue:
-            self.task_queue.append(image_token)
-            self.task_status[image_token].update({"queued_at": datetime.now().isoformat(), "upload_url": upload_url})
-            print(f"Task {image_token} added to queue. Current queue size: {len(self.task_queue)}")
-        else:
-            print(f"Task {image_token} is already in the queue.")
+        self.task_status[image_token].update({
+            "queued_at": datetime.now().isoformat(),
+            "upload_url": upload_url
+        })
+        # Put task in queue
+        self.task_queue.put_nowait(image_token)
+        print(f"Task {image_token} added to queue. Current queue size: {self.task_queue.qsize()}")
 
     def get_task_status(self, task_id: str) -> dict:
         return self.task_status.get(task_id)
 
+    async def _process_single_task(self, task_id: str) -> None:
+        task = self.task_status[task_id]
+        input_image = None
+        glb_path = None
+        
+        try:
+            logging.info(f"Starting processing for task {task_id}")
+            self.update_task_status(task_id, TaskStatus.RUNNING)
+            
+            input_image = os.path.join(TMP_DIR, IMG_DIR, 
+                f"{task['image_token']}.{task['image_extension']}")
+            
+            logging.info(f"Task {task_id}: Converting image to 3D")
+            state = image_to_3d(input_image)
+            
+            logging.info(f"Task {task_id}: Extracting GLB")
+            glb_mesh = extract_glb(state)
+            
+            # Save the GLB to a temporary file
+            save_dir = os.path.join(TMP_DIR, MODEL_DIR)
+            os.makedirs(save_dir, exist_ok=True)
+            glb_path = os.path.join(save_dir, f"{task_id}.glb")
+            glb_mesh.export(glb_path)
+            logging.info(f"Task {task_id}: GLB saved to {glb_path}")
+            
+            logging.info(f"Task {task_id}: Uploading model to: {task['upload_url']}")
+            with open(glb_path, 'rb') as f:
+                response = requests.put(task['upload_url'], data=f)
+                response.raise_for_status()
+            
+            self.update_task_status(task_id, TaskStatus.SUCCESS)
+            logging.info(f"Task {task_id}: Model uploaded successfully")
+            
+        except Exception as e:
+            logging.error(f"Error processing task {task_id}: {str(e)}", exc_info=True)
+            self.update_task_status(task_id, TaskStatus.FAILED, error=str(e))
+        finally:
+            # Cleanup
+            for path in [input_image, glb_path]:
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                        logging.info(f"Task {task_id}: Cleaned up temporary file: {path}")
+                    except Exception as e:
+                        logging.warning(f"Task {task_id}: Failed to clean up file {path}: {str(e)}")
+            
+            self.last_task_completed = datetime.now()
+            queue_size = self.task_queue.qsize()
+            logging.info(f"Task {task_id}: Completed. Remaining queue size: {queue_size}")
+
 # Initialize task manager
 task_manager = TaskManager()
-pipeline = TrellisImageTo3DPipeline.from_pretrained("/content/model")
-pipeline.cuda()
 
 def pack_state(gs: Gaussian, mesh: MeshExtractResult) -> dict:
     return {
@@ -206,6 +218,9 @@ def unpack_state(state: dict) -> Tuple[Gaussian, edict]:
 def image_to_3d(image_path: str) -> dict:
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image not found: {image_path}")
+    
+    if pipeline is None:
+        raise RuntimeError("Pipeline is not initialized.")
 
     image = Image.open(image_path).convert("RGBA")
     outputs = pipeline.run(
@@ -259,50 +274,74 @@ async def get_task_status(task_id: str) -> dict:
 @app.get("/tasks")
 async def get_all_tasks() -> dict:
     return {
-        "queue_length": len(task_manager.task_queue),
+        "queue_length": task_manager.task_queue.qsize(),
         "tasks": task_manager.task_status
     }
 
+class UploadImageRequest(BaseModel):
+    image_url: str
+    file_extension: str
+
 @app.post("/upload_image")
-async def upload_image(file: UploadFile = File(...)):
+async def upload_image(request: UploadImageRequest):
     try:
-        file_ext = os.path.splitext(file.filename)[1].lower().lstrip('.')
-        if file_ext not in ['jpg', 'jpeg', 'png']:
+        image_url = request.image_url
+        file_ext = request.file_extension.lower().lstrip(".")
+        logging.info(f"Received request to download image from: {image_url} with extension: {file_ext}")
+
+        if file_ext not in ["jpg", "jpeg", "png"]:
+            logging.warning(f"Rejected download of unsupported format: {file_ext}")
             return JSONResponse(
                 content={"error": f"Unsupported image format. Only JPG and PNG are supported: {file_ext}"},
                 status_code=400
             )
 
+        # Generate a unique image token
         image_token = str(uuid.uuid4())
-        task_manager.new_task(image_token, file_ext)
+        logging.info(f"Generated token: {image_token}")
         
         save_dir = os.path.join(TMP_DIR, IMG_DIR)
         os.makedirs(save_dir, exist_ok=True)
-        
-        file_content = await file.read()
         file_path = os.path.join(save_dir, f"{image_token}.{file_ext}")
-        
+
+        # Download the file
+        response = requests.get(image_url, stream=True)
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to download image from S3.")
+
         with open(file_path, "wb") as f:
-            f.write(file_content)
+            for chunk in response.iter_content(1024):
+                f.write(chunk)
+
+        logging.info(f"Successfully saved downloaded image: {file_path}")
+        
+        # Create initial task entry
+        task_manager.new_task(image_token, file_ext)
 
         return JSONResponse(content={
             "data": {
                 "image_token": image_token
             }
         })
-        
+
     except Exception as e:
+        logging.error(f"Error processing image download: {str(e)}", exc_info=True)
         return JSONResponse(content={"error": str(e)}, status_code=500)
+    
+class GenerateModelRequest(BaseModel):
+    image_token: str
+    upload_url: str
 
 @app.post("/generate_model")
-async def generate_model(request: dict):
+async def generate_model(request: GenerateModelRequest):
     try:
-        input_data = request["input"]
-        image_token = input_data["image_token"]
-        upload_url = input_data["upload_url"]
+        image_token = request.image_token
+        upload_url = request.upload_url
 
+        logging.info(f"Received generate_model request for token: {image_token}")
         task_manager.queue_task(image_token, upload_url)
-        queue_length = len(task_manager.task_queue)
+        queue_length = task_manager.task_queue.qsize()
+        logging.info(f"Task {image_token} queued. Position in queue: {queue_length}")
         
         return JSONResponse(content={
             "data": {
@@ -312,7 +351,43 @@ async def generate_model(request: dict):
         })
         
     except Exception as e:
+        logging.error(f"Error in generate_model: {str(e)}", exc_info=True)
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Create necessary directories
+    os.makedirs(os.path.join(TMP_DIR, IMG_DIR), exist_ok=True)
+    os.makedirs(os.path.join(TMP_DIR, MODEL_DIR), exist_ok=True)
+    
+    logging.info("Initializing Trellis pipeline...")
+    pipeline = TrellisImageTo3DPipeline.from_pretrained("/content/model")
+    pipeline.cuda()
+    logging.info("Pipeline initialized successfully")
+    
+    # Create and set the event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Create the background task before running uvicorn
+    background_task = None
+    
+    # Define startup and shutdown events
+    @app.on_event("startup")
+    async def startup_event():
+        global background_task
+        # Start the task manager's process_queue as a background task
+        background_task = asyncio.create_task(task_manager.process_queue())
+    
+    @app.on_event("shutdown")
+    async def shutdown_event():
+        if background_task:
+            background_task.cancel()
+            try:
+                await background_task
+            except asyncio.CancelledError:
+                pass
+    
+    # Run the app with the configured event loop
+    config = uvicorn.Config(app, host="0.0.0.0", port=8000, loop=loop)
+    server = uvicorn.Server(config)
+    loop.run_until_complete(server.serve())
