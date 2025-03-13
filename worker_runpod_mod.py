@@ -137,22 +137,33 @@ class TaskManager:
                 f"{task['image_token']}.{task['image_extension']}")
             
             logging.info(f"Task {task_id}: Converting image to 3D")
-            state = image_to_3d(input_image)
+            state = await asyncio.get_event_loop().run_in_executor(
+                None, image_to_3d, input_image
+            )
             
             logging.info(f"Task {task_id}: Extracting GLB")
-            glb_mesh = extract_glb(state)
+            glb_mesh = await asyncio.get_event_loop().run_in_executor(
+                None, extract_glb, state
+            )
             
             # Save the GLB to a temporary file
             save_dir = os.path.join(TMP_DIR, MODEL_DIR)
             os.makedirs(save_dir, exist_ok=True)
             glb_path = os.path.join(save_dir, f"{task_id}.glb")
-            glb_mesh.export(glb_path)
+            
+            # Export GLB in thread pool
+            await asyncio.get_event_loop().run_in_executor(
+                None, glb_mesh.export, glb_path
+            )
             logging.info(f"Task {task_id}: GLB saved to {glb_path}")
             
-            logging.info(f"Task {task_id}: Uploading model to: {task['upload_url']}")
-            with open(glb_path, 'rb') as f:
-                response = requests.put(task['upload_url'], data=f)
-                response.raise_for_status()
+            # Upload in thread pool
+            def upload_file():
+                with open(glb_path, 'rb') as f:
+                    response = requests.put(task['upload_url'], data=f)
+                    response.raise_for_status()
+                
+            await asyncio.get_event_loop().run_in_executor(None, upload_file)
             
             self.update_task_status(task_id, TaskStatus.SUCCESS)
             logging.info(f"Task {task_id}: Model uploaded successfully")
@@ -269,7 +280,9 @@ async def get_task_status(task_id: str) -> dict:
     status = task_manager.get_task_status(task_id)
     if not status:
         raise HTTPException(status_code=404, detail="Task not found")
-    return status
+    return JSONResponse(content={
+        "data": status
+    })
 
 @app.get("/tasks")
 async def get_all_tasks() -> dict:
