@@ -28,6 +28,8 @@ TMP_DIR = "content"
 IMG_DIR = "images"
 MODEL_DIR = "models"
 
+PERSISTENT_VOLUME_PATH="/workspace"
+
 class TaskStatus(Enum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -373,7 +375,7 @@ if __name__ == "__main__":
     os.makedirs(os.path.join(TMP_DIR, MODEL_DIR), exist_ok=True)
     
     logging.info("Initializing Trellis pipeline...")
-    pipeline = TrellisImageTo3DPipeline.from_pretrained("/content/model")
+    pipeline = TrellisImageTo3DPipeline.from_pretrained(f"/{PERSISTENT_VOLUME_PATH}/model")
     pipeline.cuda()
     logging.info("Pipeline initialized successfully")
     
