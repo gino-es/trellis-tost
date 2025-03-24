@@ -5,9 +5,13 @@ set -e  # Exit immediately if a command exits with a non-zero status
 # Define the persistent volume path
 PERSISTENT_VOLUME_PATH="/workspace"
 CUDA_INSTALL_PATH="$PERSISTENT_VOLUME_PATH/cuda"
+TORCH_CACHE_PATH="$PERSISTENT_VOLUME_PATH/.cache/torch/hub"
+
+# Set TORCH_HOME to use the persistent cache directory
+export TORCH_HOME="$PERSISTENT_VOLUME_PATH/.cache/torch"
 
 # Create the directory if it doesn't exist
-mkdir -p $PERSISTENT_VOLUME_PATH
+mkdir -p $PERSISTENT_VOLUME_PATH $TORCH_CACHE_PATH
 
 # Ensure the script has the necessary permissions
 chmod -R 777 $PERSISTENT_VOLUME_PATH
@@ -48,10 +52,9 @@ if [ ! -f $PERSISTENT_VOLUME_PATH/model/pipeline.json ]; then
     aria2c --console-log-level=error -c -x 16 -s 16 -k 1M https://huggingface.co/JeffreyXiang/TRELLIS-image-large/resolve/main/ckpts/ss_enc_conv3d_16l8_fp16.safetensors -d $PERSISTENT_VOLUME_PATH/model/ckpts -o ss_enc_conv3d_16l8_fp16.safetensors && \
     aria2c --console-log-level=error -c -x 16 -s 16 -k 1M https://huggingface.co/JeffreyXiang/TRELLIS-image-large/raw/main/ckpts/ss_flow_img_dit_L_16l8_fp16.json -d $PERSISTENT_VOLUME_PATH/model/ckpts -o ss_flow_img_dit_L_16l8_fp16.json && \
     aria2c --console-log-level=error -c -x 16 -s 16 -k 1M https://huggingface.co/JeffreyXiang/TRELLIS-image-large/resolve/main/ckpts/ss_flow_img_dit_L_16l8_fp16.safetensors -d $PERSISTENT_VOLUME_PATH/model/ckpts -o ss_flow_img_dit_L_16l8_fp16.safetensors && \
-    aria2c --console-log-level=error -c -x 16 -s 16 -k 1M https://github.com/facebookresearch/dinov2/zipball/main -d /home/camenduru/.cache/torch/hub -o main.zip && \
-    aria2c --console-log-level=error -c -x 16 -s 16 -k 1M https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_reg4_pretrain.pth -d /home/camenduru/.cache/torch/hub/checkpoints -o dinov2_vitl14_reg4_pretrain.pth && \
-    aria2c --console-log-level=error -c -x 16 -s 16 -k 1M https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx -d /home/camenduru/.u2net -o u2net.onnx && \
-    aria2c --console-log-level=error -c -x 16 -s 16 -k 1M https://github.com/facebookresearch/dinov2/zipball/main -d /home/camenduru/.cache/torch/hub -o main.zip
+    aria2c --console-log-level=error -c -x 16 -s 16 -k 1M https://github.com/facebookresearch/dinov2/zipball/main -d $TORCH_CACHE_PATH -o main.zip && \
+    aria2c --console-log-level=error -c -x 16 -s 16 -k 1M https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_reg4_pretrain.pth -d $TORCH_CACHE_PATH/checkpoints -o dinov2_vitl14_reg4_pretrain.pth && \
+    aria2c --console-log-level=error -c -x 16 -s 16 -k 1M https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx -d /home/camenduru/.u2net -o u2net.onnx
 else
     echo "Model files already downloaded."
 fi
